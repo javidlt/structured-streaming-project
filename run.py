@@ -125,6 +125,29 @@ def _wait_neo4j(uri: str, user: str, password: str, timeout: int) -> bool:
 # ---------------------------------------------------------------------------
 # Docker + topic + bootstrap
 # ---------------------------------------------------------------------------
+def _ensure_java() -> None:
+    """Spark needs a JRE on the host. Fail fast with a clear message if absent."""
+    java = shutil.which("java")
+    if java is None:
+        console.print(
+            "[red]✗ java not found on PATH — Spark cannot run.[/red]\n"
+            "  Install OpenJDK 17 with:\n"
+            "    [bold]brew install openjdk@17[/bold]\n"
+            "    [bold]sudo ln -sfn /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk "
+            "/Library/Java/JavaVirtualMachines/openjdk-17.jdk[/bold]"
+        )
+        sys.exit(1)
+    try:
+        result = subprocess.run(
+            [java, "-version"], capture_output=True, text=True, timeout=10,
+        )
+        # `java -version` prints to stderr historically.
+        version_str = (result.stderr or result.stdout).strip().splitlines()[0]
+        console.print(f"  [green]✓ java available[/green] — {version_str}")
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[yellow]could not verify java version: {exc}[/yellow]")
+
+
 def _ensure_docker_compose() -> str:
     if shutil.which("docker") is None:
         console.print("[red]docker not found in PATH[/red]")
@@ -437,6 +460,7 @@ def main() -> int:
     refresh = int(os.environ.get("DASHBOARD_REFRESH_SECONDS", "3"))
     health_timeout = int(os.environ.get("HEALTHCHECK_TIMEOUT_SECONDS", "180"))
 
+    _ensure_java()
     compose_cmd = _ensure_docker_compose()
     state = PipelineState()
 
