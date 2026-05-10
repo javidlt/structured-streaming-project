@@ -1,6 +1,6 @@
 # Structured Streaming Project — Kafka → Spark → Neo4j
 
-ITESO · Maestría en Sistemas Computacionales · *Procesamiento de Datos Masivos* · Proyecto Final (Parte II — Streaming).
+ITESO · Ingeniería en Sistemas Computacionales · *Procesamiento de Datos Masivos* · Proyecto Final (Parte II — Streaming).
 
 This project takes the synthetic-transaction generator from the batch project (Part I) and turns it into a **real-time pipeline**: a Kafka producer streams transactions continuously, a Spark Structured Streaming consumer parses + filters + windows them, and a Neo4j graph stores both the raw transaction subgraph and a 1-minute windowed `CategoryStats` aggregate. Everything runs locally via Docker Compose, kicked off by a single `python run.py`.
 
@@ -27,8 +27,9 @@ This project takes the synthetic-transaction generator from the batch project (P
 
 | Nombre | Matrícula |
 | --- | --- |
-| _por completar_ | _por completar_ |
-| _por completar_ | _por completar_ |
+| Francisco Javier De la Torre Silva | 745974 |
+| Mauricio Figueroa Guerrero | 749273 |
+| Santiago Villa Rodríguez | 744676 |
 
 ---
 
