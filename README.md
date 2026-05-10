@@ -42,6 +42,27 @@ This project takes the synthetic-transaction generator from the batch project (P
   ```
 - **Java 17+** on the host (Spark 3.5 requires it). Verify with `java -version`.
 
+  **macOS (Homebrew):**
+  ```bash
+  brew install openjdk@17
+  # openjdk is keg-only — expose it so `java` is on PATH:
+  sudo ln -sfn /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk \
+              /Library/Java/JavaVirtualMachines/openjdk-17.jdk
+  java -version   # should print: openjdk version "17.x.x"
+  ```
+
+  **Windows (winget, PowerShell as administrator):**
+  ```powershell
+  winget install --id EclipseAdoptium.Temurin.17.JDK -e
+  # close & reopen the terminal, then:
+  java -version
+  ```
+  If `java` is still not found, add it to PATH manually:
+  ```powershell
+  setx JAVA_HOME "C:\Program Files\Eclipse Adoptium\jdk-17.x.x-hotspot"
+  setx PATH "%PATH%;%JAVA_HOME%\bin"
+  ```
+
 ---
 
 ## Quickstart
@@ -63,6 +84,25 @@ uv run python run.py
 
 Stop everything with **Ctrl+C** — `run.py` will confirm, then SIGTERM the children and tear Compose down.
 
+### `--log` mode (see every message in flight)
+
+Add the `--log` flag to expose two extra live panels that make the data flow visible end-to-end:
+
+```bash
+uv run python run.py --log
+```
+
+What you'll see beneath the metrics dashboard:
+
+| Panel | What it shows | How it's gathered |
+| --- | --- | --- |
+| `producer → kafka` | Last 15 transactions emitted to the topic, with `txn_id`, customer, merchant, amount, currency, status (green=approved, red=declined, yellow=pending), country, payment method | A background `KafkaConsumer` thread (group_id=None, `auto_offset_reset=latest`) subscribed to `transactions`. Does **not** interfere with Spark — Spark tracks its own offsets via the structured-streaming checkpoint. |
+| `spark consumer → neo4j` | Last 12 `foreachBatch` commits, one row per micro-batch, showing which sink (`raw_graph` or `category_stats`) wrote how many rows | A background thread tails `logs/consumer.out` for lines matching `[<sink>] batch=<n> rows=<m>`, which the Spark app logs for every batch. |
+
+The two panels are aligned in time, so you can watch a transaction land on Kafka and then watch the next consumer batch include it. Approved transactions become `:Transaction` nodes; declined/pending ones are filtered out by the Spark `.where(status == 'approved')`. The `category_stats` panel only fires once a 1-minute tumbling window closes (plus the watermark threshold), so expect it to stay quiet for the first ~2 minutes.
+
+Without `--log`, the dashboard stays compact (metrics only) — useful if you want a clean view for screenshots.
+
 ---
 
 ## URLs
@@ -74,6 +114,18 @@ Stop everything with **Ctrl+C** — `run.py` will confirm, then SIGTERM the chil
 | Neo4j Browser | http://localhost:7474 | Cypher REPL + graph visualization (login `neo4j` / `streaming123`) |
 | Neo4j Bolt | `bolt://localhost:7687` | Driver endpoint (used by Spark connector + bootstrap loader) |
 | Spark UI | http://localhost:4040 | Streaming progress, batch timings, query plans |
+
+### Neo4j credentials
+
+| Field | Value |
+| --- | --- |
+| Bolt URI | `bolt://localhost:7687` |
+| Browser URL | http://localhost:7474 |
+| Database | `neo4j` (default) |
+| Username | `neo4j` |
+| Password | `streaming123` |
+
+In Neo4j Browser, the first prompt asks for `Connect URL` (`bolt://localhost:7687`), username (`neo4j`) and password (`streaming123`). The Cypher REPL at the top defaults to the `neo4j` database, which is what the producer/consumer write to.
 
 ---
 

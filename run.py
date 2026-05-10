@@ -16,6 +16,9 @@ It will:
 """
 from __future__ import annotations
 
+import argparse
+import collections
+import json
 import os
 import re
 import shutil
@@ -23,6 +26,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -72,6 +76,182 @@ class PipelineState:
     consumer_lag: int = 0
     neo4j_counts: dict[str, int] = field(default_factory=dict)
     neo4j_rels: int = 0
+
+
+# ---------------------------------------------------------------------------
+# --log mode tailers
+# ---------------------------------------------------------------------------
+class KafkaTail:
+    """Background thread that reads the topic into a rolling buffer for display.
+
+    Uses no consumer group (group_id=None) so it doesn't interfere with Spark's
+    offset tracking. Starts from `latest`, so we only show messages emitted
+    after the dashboard came up.
+    """
+
+    def __init__(self, bootstrap: str, topic: str, maxlen: int = 15):
+        self.bootstrap = bootstrap
+        self.topic = topic
+        self.messages: collections.deque[tuple[datetime, dict]] = collections.deque(maxlen=maxlen)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="kafka-tail", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                consumer = KafkaConsumer(
+                    self.topic,
+                    bootstrap_servers=self.bootstrap,
+                    auto_offset_reset="latest",
+                    enable_auto_commit=False,
+                    group_id=None,
+                    value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+                    consumer_timeout_ms=500,
+                )
+                backoff = 1.0
+            except Exception:  # noqa: BLE001
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 10)
+                continue
+
+            try:
+                while not self._stop.is_set():
+                    for record in consumer:
+                        if self._stop.is_set():
+                            break
+                        try:
+                            self.messages.append((datetime.now(), record.value))
+                        except Exception:  # noqa: BLE001
+                            pass
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                try:
+                    consumer.close(autocommit=False)
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+_BATCH_LOG_RE = re.compile(r"\[(?P<sink>[\w_]+)\]\s+batch=(?P<batch>\d+)\s+rows=(?P<rows>\d+)")
+
+
+class ConsumerLogTail:
+    """Background thread that scrapes `logs/consumer.out` for foreachBatch lines.
+
+    The Spark consumer logs ``[raw_graph] batch=N rows=M`` and
+    ``[category_stats] batch=N rows=M`` for every micro-batch it commits to
+    Neo4j. We tail those into a rolling buffer to visualize what the consumer
+    is doing on the receiving side of the pipeline.
+    """
+
+    def __init__(self, path: Path, maxlen: int = 12):
+        self.path = path
+        self.events: collections.deque[tuple[datetime, str, int, int]] = collections.deque(maxlen=maxlen)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="consumer-log-tail", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        # Wait for the consumer log to appear.
+        while not self._stop.is_set() and not self.path.exists():
+            time.sleep(0.5)
+        if self._stop.is_set():
+            return
+        try:
+            with self.path.open("r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(0, os.SEEK_END)
+                while not self._stop.is_set():
+                    line = fh.readline()
+                    if not line:
+                        time.sleep(0.5)
+                        continue
+                    match = _BATCH_LOG_RE.search(line)
+                    if match:
+                        self.events.append((
+                            datetime.now(),
+                            match.group("sink"),
+                            int(match.group("batch")),
+                            int(match.group("rows")),
+                        ))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _render_producer_messages_panel(tail: KafkaTail) -> Panel:
+    table = Table(show_header=True, header_style="bold magenta", expand=True, box=None)
+    table.add_column("seen_at", style="dim", no_wrap=True)
+    table.add_column("txn_id", style="cyan", justify="right")
+    table.add_column("cust", justify="right")
+    table.add_column("merch", justify="right")
+    table.add_column("amount", justify="right")
+    table.add_column("cur")
+    table.add_column("status")
+    table.add_column("country", style="dim")
+    table.add_column("payment")
+    for seen_at, msg in list(tail.messages):
+        status = str(msg.get("status", ""))
+        if status == "approved":
+            status_styled = "[green]approved[/green]"
+        elif status == "declined":
+            status_styled = "[red]declined[/red]"
+        else:
+            status_styled = f"[yellow]{status}[/yellow]"
+        try:
+            amount = f"{float(msg.get('amount', 0)):,.2f}"
+        except (TypeError, ValueError):
+            amount = str(msg.get("amount", ""))
+        table.add_row(
+            seen_at.strftime("%H:%M:%S"),
+            str(msg.get("transaction_id", "")),
+            str(msg.get("customer_id", "")),
+            str(msg.get("merchant_id", "")),
+            amount,
+            str(msg.get("currency", "")),
+            status_styled,
+            str(msg.get("transaction_country", "")),
+            str(msg.get("payment_method", "")),
+        )
+    return Panel(
+        table,
+        title="[bold]producer → kafka — last 15 messages on `transactions`[/bold]",
+        border_style="magenta",
+        padding=(0, 1),
+    )
+
+
+def _render_consumer_commits_panel(tail: ConsumerLogTail) -> Panel:
+    table = Table(show_header=True, header_style="bold blue", expand=True, box=None)
+    table.add_column("seen_at", style="dim", no_wrap=True)
+    table.add_column("sink", style="cyan")
+    table.add_column("batch", justify="right")
+    table.add_column("rows committed", justify="right")
+    for seen_at, sink, batch, rows in list(tail.events):
+        sink_styled = (
+            f"[green]{sink}[/green]" if sink == "raw_graph"
+            else f"[yellow]{sink}[/yellow]"
+        )
+        rows_styled = str(rows) if rows > 0 else f"[dim]{rows}[/dim]"
+        table.add_row(seen_at.strftime("%H:%M:%S"), sink_styled, str(batch), rows_styled)
+    return Panel(
+        table,
+        title="[bold]spark consumer → neo4j — last 12 foreachBatch commits[/bold]",
+        border_style="blue",
+        padding=(0, 1),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +618,25 @@ def _shutdown(state: PipelineState, compose_cmd: str) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="run.py",
+        description="Bring up the Kafka → Spark → Neo4j streaming pipeline.",
+    )
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help=(
+            "Show two extra live panels: every producer message landing on the "
+            "Kafka topic (last 15) and every foreachBatch commit the Spark "
+            "consumer writes to Neo4j (last 12)."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
 def main() -> int:
+    args = _parse_args()
     load_dotenv()
 
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -501,8 +699,28 @@ def main() -> int:
         console.print("[bold cyan]▶ launching Spark consumer[/bold cyan]")
         _spawn_consumer(state)
 
+        kafka_tail: Optional[KafkaTail] = None
+        consumer_log_tail: Optional[ConsumerLogTail] = None
+        if args.log:
+            console.print("[bold cyan]▶ --log mode: starting message tailers[/bold cyan]")
+            kafka_tail = KafkaTail(bootstrap, topic, maxlen=15)
+            kafka_tail.start()
+            consumer_log_tail = ConsumerLogTail(LOGS_DIR / "consumer.out", maxlen=12)
+            consumer_log_tail.start()
+
+        def _build_view() -> Group:
+            dashboard = _render_dashboard(state, topic)
+            if not args.log:
+                return dashboard
+            assert kafka_tail is not None and consumer_log_tail is not None
+            return Group(
+                dashboard,
+                _render_producer_messages_panel(kafka_tail),
+                _render_consumer_commits_panel(consumer_log_tail),
+            )
+
         # Live dashboard.
-        with Live(_render_dashboard(state, topic), console=console,
+        with Live(_build_view(), console=console,
                   refresh_per_second=2, screen=False) as live:
             while not interrupted["flag"]:
                 state.last_produced = _scrape_producer_count(state.producer_log)
@@ -510,7 +728,7 @@ def main() -> int:
                 state.neo4j_counts, state.neo4j_rels = _scrape_neo4j(
                     neo4j_uri, neo4j_user, neo4j_pwd
                 )
-                live.update(_render_dashboard(state, topic))
+                live.update(_build_view())
                 # Exit fast if a child crashed.
                 for proc, name in ((state.producer_proc, "producer"),
                                    (state.consumer_proc, "consumer")):
@@ -520,6 +738,11 @@ def main() -> int:
                     if interrupted["flag"]:
                         break
                     time.sleep(0.1)
+
+        if kafka_tail is not None:
+            kafka_tail.stop()
+        if consumer_log_tail is not None:
+            consumer_log_tail.stop()
 
         console.print()
         try:
